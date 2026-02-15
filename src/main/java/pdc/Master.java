@@ -255,13 +255,28 @@ public class Master {
         // Find available worker
         String workerId = availableWorkers.poll();
         if (workerId == null) {
-            // Round-robin if no workers in queue
-            workerId = workers.keys().nextElement();
+            // Round-robin if no workers in queue - try to find any alive worker
+            for (String id : workers.keySet()) {
+                WorkerConnection w = workers.get(id);
+                if (w != null && w.alive) {
+                    workerId = id;
+                    break;
+                }
+            }
+        }
+        
+        if (workerId == null) {
+            // No workers available - task stays PENDING for retry
+            System.err.println("[Master] No workers available for task " + task.taskId);
+            taskStatus.put(task.taskId, TaskStatus.PENDING);
+            return;
         }
         
         WorkerConnection worker = workers.get(workerId);
         if (worker == null || !worker.alive) {
-            // Worker disappeared, try next
+            // Worker disappeared, mark task as pending for retry
+            System.err.println("[Master] Worker " + workerId + " unavailable for task " + task.taskId);
+            taskStatus.put(task.taskId, TaskStatus.PENDING);
             return;
         }
         
@@ -289,7 +304,11 @@ public class Master {
         } catch (IOException e) {
             System.err.println("[Master] Failed to assign task " + task.taskId + ": " + 
                 e.getMessage());
-            taskStatus.put(task.taskId, TaskStatus.FAILED);
+            // Mark as PENDING so it will be retried
+            taskStatus.put(task.taskId, TaskStatus.PENDING);
+            task.assignedWorker = null;
+            // Mark worker as dead
+            worker.alive = false;
         }
     }
     
@@ -302,6 +321,7 @@ public class Master {
             Task task = entry.getValue();
             TaskStatus status = taskStatus.get(task.taskId);
             
+            // Reassign tasks that are assigned to dead workers
             if (status == TaskStatus.ASSIGNED && task.assignedWorker != null) {
                 WorkerConnection worker = workers.get(task.assignedWorker);
                 if (worker == null || !worker.alive) {
@@ -312,6 +332,12 @@ public class Master {
                     task.assignedWorker = null;
                     assignTaskToWorker(task);
                 }
+            }
+            // Retry tasks that are PENDING or FAILED (couldn't be assigned)
+            else if (status == TaskStatus.PENDING || status == TaskStatus.FAILED) {
+                System.err.println("[Master] Retrying task " + task.taskId + " (status: " + status + ")");
+                task.assignedWorker = null;
+                assignTaskToWorker(task);
             }
         }
     }
@@ -444,7 +470,31 @@ public class Master {
                 WorkerConnection worker = workers.get(workerId);
                 if (worker != null) {
                     worker.alive = false;
+                    System.err.println("[Master] Worker " + workerId + " marked as dead");
+                    
+                    // Immediately reassign this worker's tasks
+                    for (Map.Entry<Long, Task> entry : tasks.entrySet()) {
+                        Task task = entry.getValue();
+                        if (workerId.equals(task.assignedWorker)) {
+                            TaskStatus status = taskStatus.get(task.taskId);
+                            if (status == TaskStatus.ASSIGNED) {
+                                System.err.println("[Master] Immediate reassignment of task " + 
+                                    task.taskId + " from dead worker " + workerId);
+                                taskStatus.put(task.taskId, TaskStatus.PENDING);
+                                task.assignedWorker = null;
+                            }
+                        }
+                    }
                 }
+            }
+            
+            // Close socket
+            try {
+                if (socket != null && !socket.isClosed()) {
+                    socket.close();
+                }
+            } catch (IOException e) {
+                // Ignore
             }
         }
     }
